@@ -1,0 +1,300 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Protection at Code Speed: autonomous detect-and-quarantine for compromised EC2 instances'
+
+Resources:
+  # ==========================================
+  # 1. NETWORK & STORAGE
+  # ==========================================
+  MyVPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.0.0.0/16
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags: [{Key: Name, Value: Smart-Project-VPC}]
+
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+
+  VPCGatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref MyVPC
+      InternetGatewayId: !Ref InternetGateway
+
+  PublicSubnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref MyVPC
+      CidrBlock: 10.0.1.0/24
+      MapPublicIpOnLaunch: true
+      # FIX: Force first AZ to avoid "unsupported AZ" errors
+      AvailabilityZone: !Select [ 0, !GetAZs '' ]
+      Tags: [{Key: Name, Value: Public-Subnet}]
+
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref MyVPC
+
+  PublicRoute:
+    Type: AWS::EC2::Route
+    DependsOn: VPCGatewayAttachment
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  SubnetRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnet
+      RouteTableId: !Ref PublicRouteTable
+
+  ForensicsBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub 'smart-defense-logs-${AWS::AccountId}-${AWS::Region}'
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+
+  # ==========================================
+  # 2. SECURITY GROUPS
+  # ==========================================
+  NormalSG:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Allow HTTP traffic
+      VpcId: !Ref MyVPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+        # No SSH: the demo doesn't need it, and an open port 22 is an attack surface
+
+  QuarantineSG:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: QUARANTINE - No Inbound Access
+      VpcId: !Ref MyVPC
+      # Intentionally Empty Ingress Rules
+
+  # ==========================================
+  # 3. IAM ROLES
+  # ==========================================
+  EC2Role:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement: [{Effect: Allow, Principal: {Service: ec2.amazonaws.com}, Action: sts:AssumeRole}]
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/CloudWatchAgentServerPolicy
+
+  EC2InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles: [ !Ref EC2Role ]
+
+  LambdaSmartRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement: [{Effect: Allow, Principal: {Service: lambda.amazonaws.com}, Action: sts:AssumeRole}]
+      Policies:
+        - PolicyName: SmartDefensePolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: [logs:CreateLogGroup, logs:CreateLogStream, logs:PutLogEvents]
+                Resource: arn:aws:logs:*:*:*
+              - Effect: Allow
+                Action: [ec2:ModifyInstanceAttribute, ec2:DescribeInstances]
+                Resource: '*'
+              - Effect: Allow
+                Action: [s3:PutObject]
+                Resource: !Sub '${ForensicsBucket.Arn}/*'
+              - Effect: Allow
+                Action: [cloudwatch:GetMetricStatistics]
+                Resource: '*'
+
+  # ==========================================
+  # 4. THE SERVER (Auto-Attack Logic)
+  # ==========================================
+  WebServer:
+    Type: AWS::EC2::Instance
+    Properties:
+      InstanceType: t3.micro
+      ImageId: '{{resolve:ssm:/aws/service/ami-amazon-linux-latest/amzn2-ami-hvm-x86_64-gp2}}'
+      SubnetId: !Ref PublicSubnet
+      SecurityGroupIds: [ !Ref NormalSG ]
+      IamInstanceProfile: !Ref EC2InstanceProfile
+      Tags: [{Key: Name, Value: Smart-Victim-Server}]
+      UserData:
+        Fn::Base64: |
+          #!/bin/bash
+          # Basic Setup
+          yum update -y
+          yum install -y httpd
+          systemctl start httpd
+          systemctl enable httpd
+          
+          # Create Initial "Green" Website
+          echo "<html><body style='background-color:#e6fffa; text-align:center; font-family:sans-serif; padding:50px;'>" > /var/www/html/index.html
+          echo "<h1>✅ System Status: HEALTHY</h1>" >> /var/www/html/index.html
+          echo "<h3>Smart Defense Agent is Monitoring...</h3>" >> /var/www/html/index.html
+          echo "<p>Waiting for traffic analysis...</p>" >> /var/www/html/index.html
+          echo "</body></html>" >> /var/www/html/index.html
+
+          # --- THE TIME BOMB ---
+          # Run in background so UserData finishes successfully
+          (
+            # Wait 5 minutes (300 seconds) to allow you to present "Green" state
+            sleep 300
+            
+            # Change Website to "RED"
+            echo "<html><body style='background-color:#ffe6e6; text-align:center; font-family:sans-serif; padding:50px;'>" > /var/www/html/index.html
+            echo "<h1>⚠️ ATTACK DETECTED</h1>" >> /var/www/html/index.html
+            echo "<h3>High CPU Load / Suspicious Activity</h3>" >> /var/www/html/index.html
+            echo "<p>System is under heavy load...</p>" >> /var/www/html/index.html
+            echo "</body></html>" >> /var/www/html/index.html
+
+            # START ATTACK (Native Linux Command - No Installation Needed)
+            # This generates 100% CPU load immediately
+            for i in 1 2 3 4; do
+                while :; do openssl speed >/dev/null 2>&1; done &
+            done
+          ) &
+
+  # ==========================================
+  # 5. DEFENSE SYSTEM (CW -> SNS -> Lambda)
+  # ==========================================
+  AlertTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: SmartAlerts
+
+  HighCPUAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: "Trigger when CPU > 50%"
+      MetricName: CPUUtilization
+      Namespace: AWS/EC2
+      Statistic: Average
+      Period: 60
+      EvaluationPeriods: 1
+      Threshold: 50.0
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: InstanceId
+          Value: !Ref WebServer
+      AlarmActions:
+        - !Ref AlertTopic
+
+  SmartLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaSmartRole.Arn
+      Runtime: python3.12
+      Timeout: 60
+      Environment:
+        Variables:
+          QUARANTINE_SG_ID: !Ref QuarantineSG
+          FORENSICS_BUCKET: !Ref ForensicsBucket
+      Code:
+        ZipFile: |
+          import boto3
+          import os
+          import json
+          import datetime
+
+          ec2 = boto3.client('ec2')
+          cw = boto3.client('cloudwatch')
+          s3 = boto3.client('s3')
+          
+          QUARANTINE_SG = os.environ['QUARANTINE_SG_ID']
+          BUCKET = os.environ['FORENSICS_BUCKET']
+
+          def lambda_handler(event, context):
+              print("--- SMART DEFENSE ANALYZER STARTED ---")
+              
+              try:
+                  # Parse message
+                  msg = json.loads(event['Records'][0]['Sns']['Message'])
+                  instance_id = msg['Trigger']['Dimensions'][0]['value']
+                  
+                  # Get Network Metrics (Last 5 minutes)
+                  end_time = datetime.datetime.utcnow()
+                  start_time = end_time - datetime.timedelta(minutes=5)
+                  
+                  metrics = cw.get_metric_statistics(
+                      Namespace='AWS/EC2',
+                      MetricName='NetworkPacketsIn',
+                      Dimensions=[{'Name': 'InstanceId', 'Value': instance_id}],
+                      StartTime=start_time,
+                      EndTime=end_time,
+                      Period=300,
+                      Statistics=['Sum']
+                  )
+                  
+                  # Analyze Traffic
+                  total_packets = 0
+                  if metrics['Datapoints']:
+                      total_packets = metrics['Datapoints'][0]['Sum']
+                  
+                  print(f"Target: {instance_id} | CPU: CRITICAL | Network Packets (5min): {total_packets}")
+                  
+                  # SMART LOGIC:
+                  # If CPU is high but packets are low (< 2000), it's a miner/internal virus.
+                  # If packets are high (> 2000), it's valid user traffic.
+                  
+                  if total_packets > 2000:
+                      print("DECISION: LEGITIMATE TRAFFIC (Flash Sale). No Action Taken.")
+                      log_to_s3(instance_id, "IGNORED", f"High Network ({total_packets}), assuming valid users.")
+                  else:
+                      print("DECISION: MALICIOUS ACTIVITY (Crypto Miner). QUARANTINING!")
+                      ec2.modify_instance_attribute(InstanceId=instance_id, Groups=[QUARANTINE_SG])
+                      log_to_s3(instance_id, "QUARANTINED", f"High CPU with Low Network ({total_packets}) -> Suspicious.")
+
+              except Exception as e:
+                  print(f"ERROR: {str(e)}")
+
+          def log_to_s3(instance_id, action, reason):
+              log = {
+                  'timestamp': str(datetime.datetime.now()),
+                  'target_server': instance_id,
+                  'defense_action': action,
+                  'ai_reasoning': reason
+              }
+              s3.put_object(Bucket=BUCKET, Key=f'incident-{instance_id}-{action}.json', Body=json.dumps(log))
+
+  LambdaSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      Endpoint: !GetAtt SmartLambda.Arn
+      Protocol: lambda
+      TopicArn: !Ref AlertTopic
+
+  LambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref SmartLambda
+      Principal: sns.amazonaws.com
+      SourceArn: !Ref AlertTopic
+
+Outputs:
+  WebsiteURL:
+    Description: Use this URL to show the Green status (wait 5 mins for Red)
+    Value: !Sub "http://${WebServer.PublicIp}"
